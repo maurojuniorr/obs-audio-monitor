@@ -520,7 +520,7 @@ static obs_properties_t *audio_monitor_properties(void *data)
 	obs_properties_add_text(
 		ppts, "plugin_info",
 		"<a href=\"https://obsproject.com/forum/resources/audio-monitor.1186/\">Audio Monitor</a> (" PROJECT_VERSION
-		") — Rebuild v4 by <a href=\"https://github.com/maurojuniorr\">maurojuniorr</a>",
+		") — Rebuild v5 by <a href=\"https://github.com/maurojuniorr\">maurojuniorr</a>",
 		OBS_TEXT_INFO);
 	return ppts;
 }
@@ -641,7 +641,7 @@ OBS_MODULE_USE_DEFAULT_LOCALE("media-controls", "en-US")
 extern void load_audio_monitor_dock();
 bool obs_module_load()
 {
-	blog(LOG_INFO, "[Audio Monitor] loaded version %s — maurojuniorr Rebuild v4 (https://github.com/maurojuniorr)", PROJECT_VERSION);
+	blog(LOG_INFO, "[Audio Monitor] loaded version %s — maurojuniorr Rebuild v5 (https://github.com/maurojuniorr)", PROJECT_VERSION);
 	obs_register_source(&audio_monitor_filter_info);
 	load_audio_monitor_dock();
 	return true;

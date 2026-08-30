@@ -98,9 +98,78 @@ static void wait_starts(int target)
 	for (int i = 0; i < 5000 && atomic_load(&starts) < target; i++) usleep(1000);
 	assert(atomic_load(&starts) >= target);
 }
+static void test_cadence_and_fades(void)
+{
+	struct audio_monitor m = {.channels = 2, .capacity = 23040, .buffer_frames = 1440,
+		.preroll_frames = 4320, .fade_frames = 240, .enabled = true, .accepting = true, .volume = 1};
+	m.samples = calloc(m.capacity * 2, sizeof(float));
+	pthread_mutex_init(&m.mutex, NULL);
+	float input[1024], output[2880];
+	for (size_t i = 0; i < 1024; i++) input[i] = 0.25f;
+	struct obs_audio_data audio = {.frames = 1024};
+	audio.data[0] = audio.data[1] = (uint8_t *)input;
+	AudioQueueBuffer buffer = {.mAudioData = output};
+	size_t next_input = 0, packet = 0, old_frames = 0, old_missing = 0;
+	bool began = false;
+	/* Ten virtual seconds: 1024-frame capture packets, 1440-frame output
+	 * requests and occasional 10 ms arrival jitter. Compare with v4's
+	 * immediate consumption policy using the exact same event schedule. */
+	for (size_t t = 0; t < 480000; t++) {
+		if (t == next_input) {
+			audio_monitor_audio(&m, &audio);
+			old_frames += 1024;
+			packet++;
+			next_input = packet * 1024 + (packet % 7 == 0 ? 480 : 0);
+		}
+		if (t % 1440 == 0) {
+			if (old_frames < 1440) { old_missing += 1440 - old_frames; old_frames = 0; }
+			else old_frames -= 1440;
+			fill_buffer(&m, &buffer);
+			if (m.playing) {
+				if (!began) {
+					assert(output[0] == 0.0f);
+					for (size_t i = 1; i < 240; i++) assert(output[2*i] >= output[2*(i-1)]);
+				}
+				for (size_t i = began ? 0 : 240; i < 1440; i++) {
+					assert(output[2*i] == 0.25f && output[2*i+1] == 0.25f);
+				}
+				began = true;
+			} else assert(!began);
+		}
+	}
+	assert(began && m.underruns == 0 && old_missing > 0);
+	printf("Cadence: v4 policy inserted %zu silent frames; v5 has zero underruns after preroll\n", old_missing);
+	/* Source stops: drain reserve, then decay the last sample to zero. */
+	while (m.frames >= 1440) fill_buffer(&m, &buffer);
+	fill_buffer(&m, &buffer);
+	assert(!m.playing && output[2878] == 0.0f && output[2879] == 0.0f);
+	fill_buffer(&m, &buffer);
+	for (size_t i = 0; i < 2880; i++) assert(output[i] == 0.0f);
+	for (int i = 0; i < 5; i++) audio_monitor_audio(&m, &audio);
+	fill_buffer(&m, &buffer);
+	assert(m.playing && output[0] == 0.0f && output[480] == 0.25f);
+	/* An underrun one frame before the boundary must also fade smoothly. */
+	m.frames = 1439; m.read_frame = 0; m.fade_remaining = 0;
+	for (size_t i = 0; i < 2878; i++) m.samples[i] = 0.25f;
+	fill_buffer(&m, &buffer);
+	for (size_t i = 1201; i < 1440; i++) assert(fabsf(output[2*i] - output[2*(i-1)]) < 0.002f);
+	assert(output[2878] == 0.0f);
+	/* A single short notification must not remain buffered forever. */
+	m.frames = 0;
+	audio_monitor_audio(&m, &audio);
+	bool heard_short_clip = false;
+	for (int i = 0; i < 6; i++) {
+		fill_buffer(&m, &buffer);
+		for (size_t j = 0; j < 2880; j++) heard_short_clip |= output[j] != 0.0f;
+	}
+	assert(heard_short_clip && m.frames == 0);
+	pthread_mutex_destroy(&m.mutex);
+	free(m.samples);
+}
 int main(void)
 {
 	producer = pthread_self();
+	test_cadence_and_fades();
 	/* Validate DSP, wraparound, overflow and silence without a worker. */
 	struct audio_monitor ring = {.channels = 2, .capacity = 4, .buffer_frames = 4,
 		.enabled = true, .accepting = true, .volume = 1.0f};

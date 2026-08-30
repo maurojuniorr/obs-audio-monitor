@@ -29,11 +29,19 @@ These simulated tests do not establish real-device stability. Before publishing
 a release or PR, test two physical outputs, repeated source disable/enable,
 scene switching, device unplug/replug, mute/volume changes and OBS shutdown.
 
-The v4 worker keeps the queue running with silence during source underruns.
+The worker keeps the queue running with silence during source underruns.
 Explicit start/stop requests are asynchronous. After three consecutive queue
 failures in one generation it stops retrying until a new start request. Monitor
 destruction joins the worker, so a stalled OS disposal can still delay teardown,
 although normal capture no longer invokes AudioQueue APIs.
+
+v5 also tests 10 virtual seconds of 1024-frame input packets against 1440-frame
+output buffers, including 10 ms arrival jitter. The old v4 fill policy inserts
+1888 silent frames in this schedule; v5 has no underruns after pre-roll. Tests
+verify 5 ms fade-in, fade-to-zero at underruns (including near-boundary cases),
+and playback of short notifications. The reserve target is 90 ms, with a wait
+cap of six output buffers for sounds shorter than the reserve. This increases
+monitoring latency; it does not change the original source audio returned to OBS.
 
 Rebuild attribution: maurojuniorr, https://github.com/maurojuniorr.
 Original project authorship and license remain unchanged.
