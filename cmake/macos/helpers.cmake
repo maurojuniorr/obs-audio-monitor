@@ -30,8 +30,8 @@ function(set_target_properties_plugin target)
       XCODE_ATTRIBUTE_MARKETING_VERSION ${PLUGIN_VERSION}
       XCODE_ATTRIBUTE_GENERATE_INFOPLIST_FILE YES
       XCODE_ATTRIBUTE_INFOPLIST_FILE ""
-      XCODE_ATTRIBUTE_INFOPLIST_KEY_CFBundleDisplayName ${target}
-      XCODE_ATTRIBUTE_INFOPLIST_KEY_NSHumanReadableCopyright "(c) ${CURRENT_YEAR} ${PLUGIN_AUTHOR}"
+      XCODE_ATTRIBUTE_INFOPLIST_KEY_CFBundleDisplayName "Audio Monitor — maurojuniorr Rebuild v4"
+      XCODE_ATTRIBUTE_INFOPLIST_KEY_NSHumanReadableCopyright "(c) ${CURRENT_YEAR} ${PLUGIN_AUTHOR}; rebuild by maurojuniorr (github.com/maurojuniorr)"
       XCODE_ATTRIBUTE_INSTALL_PATH "$(USER_LIBRARY_DIR)/Application Support/obs-studio/plugins"
   )
 

@@ -1,434 +1,354 @@
-
 #include "audio-monitor-mac.h"
-#include <AudioUnit/AudioUnit.h>
 #include <AudioToolbox/AudioQueue.h>
 #include <CoreFoundation/CFString.h>
-#include <CoreAudio/CoreAudio.h>
-#include <util/deque.h>
 #include <obs-module.h>
+#include <util/threading.h>
+#include <math.h>
+#include <errno.h>
+#include <time.h>
 
-#include "media-io/audio-resampler.h"
-#include "util/platform.h"
-#include "util/threading.h"
-
-static bool success_(OSStatus stat, const char *func, const char *call)
-{
-	if (stat != noErr) {
-		blog(LOG_WARNING, "%s: %s failed: %d", func, call, (int)stat);
-		return false;
-	}
-
-	return true;
-}
-
-#define success(stat, call) success_(stat, __FUNCTION__, call)
+#define QUEUE_BUFFERS 3
+#define MAX_QUEUE_FAILURES 3
 
 struct audio_monitor {
+	pthread_mutex_t mutex;
+	pthread_cond_t wake;
+	pthread_t worker;
+	bool worker_created;
+	bool quit;
+	bool enabled;
+	bool accepting;
+	uint64_t generation;
 	AudioQueueRef queue;
-	AudioQueueBufferRef buffers[3];
-	size_t buffer_size;
-	size_t wait_size;
-	struct deque empty_buffers;
-	struct deque new_data;
-	volatile bool active;
-	bool stopping;
-	bool paused;
+	AudioQueueBufferRef buffers[QUEUE_BUFFERS];
+	bool ready[QUEUE_BUFFERS];
+	char *device_id;
 	uint32_t channels;
-	audio_resampler_t *resampler;
+	uint32_t sample_rate;
+	size_t buffer_frames;
+	size_t capacity;
+	size_t read_frame;
+	size_t frames;
+	float *samples;
 	float volume;
 	bool mono;
 	float balance;
-	pthread_mutex_t mutex;
-	pthread_cond_t api_idle;
-	unsigned int api_calls;
-	char *device_id;
 };
 
-static inline bool fill_buffer(struct audio_monitor *monitor)
+/* Callbacks return buffer ownership only. All AudioQueue API calls belong to
+ * the worker, never to OBS capture threads or CoreAudio callbacks. */
+static void buffer_audio(void *data, AudioQueueRef queue, AudioQueueBufferRef buffer)
 {
-	AudioQueueBufferRef buf;
-	OSStatus stat;
-
-	if (monitor->new_data.size < monitor->buffer_size) {
-		return false;
+	struct audio_monitor *m = data;
+	pthread_mutex_lock(&m->mutex);
+	if (m->accepting && m->queue == queue) {
+		for (size_t i = 0; i < QUEUE_BUFFERS; i++) {
+			if (m->buffers[i] == buffer) {
+				m->ready[i] = true;
+				break;
+			}
+		}
+		pthread_cond_signal(&m->wake);
 	}
-
-	deque_pop_front(&monitor->empty_buffers, &buf, sizeof(buf));
-	deque_pop_front(&monitor->new_data, buf->mAudioData,
-			    monitor->buffer_size);
-
-	buf->mAudioDataByteSize = monitor->buffer_size;
-
-	stat = AudioQueueEnqueueBuffer(monitor->queue, buf, 0, NULL);
-	if (!success(stat, "AudioQueueEnqueueBuffer")) {
-		blog(LOG_WARNING, "%s: %s", __FUNCTION__,
-		     "Failed to enqueue buffer");
-		deque_push_front(&monitor->empty_buffers, &buf, sizeof(buf));
-		return false;
-	}
-	return true;
+	pthread_mutex_unlock(&m->mutex);
 }
 
-static void buffer_audio(void *data, AudioQueueRef aq, AudioQueueBufferRef buf)
+static void close_queue(struct audio_monitor *m, AudioQueueRef queue)
 {
-	struct audio_monitor *monitor = data;
-	AudioQueueRef pause_queue = NULL;
-
-	pthread_mutex_lock(&monitor->mutex);
-	if (!os_atomic_load_bool(&monitor->active) || monitor->stopping) {
-		pthread_mutex_unlock(&monitor->mutex);
-		return;
-	}
-	deque_push_back(&monitor->empty_buffers, &buf, sizeof(buf));
-	while (monitor->empty_buffers.size > 0) {
-		if (!fill_buffer(monitor)) {
-			break;
-		}
-	}
-	if (monitor->empty_buffers.size == sizeof(buf) * 3) {
-		monitor->paused = true;
-		monitor->wait_size = monitor->buffer_size * 3;
-		monitor->api_calls++;
-		pause_queue = monitor->queue;
-	}
-	pthread_mutex_unlock(&monitor->mutex);
-
-	if (pause_queue) {
-		AudioQueuePause(pause_queue);
-		pthread_mutex_lock(&monitor->mutex);
-		monitor->api_calls--;
-		pthread_cond_broadcast(&monitor->api_idle);
-		pthread_mutex_unlock(&monitor->mutex);
-	}
-
-	UNUSED_PARAMETER(aq);
-}
-
-void audio_monitor_stop(struct audio_monitor *audio_monitor)
-{
-	if (!audio_monitor)
-		return;
-
-	pthread_mutex_lock(&audio_monitor->mutex);
-	while (audio_monitor->stopping)
-		pthread_cond_wait(&audio_monitor->api_idle,
-				  &audio_monitor->mutex);
-	if (!audio_monitor->queue && !audio_monitor->resampler) {
-		pthread_mutex_unlock(&audio_monitor->mutex);
-		return;
-	}
-	audio_monitor->stopping = true;
-	os_atomic_store_bool(&audio_monitor->active, false);
-	while (audio_monitor->api_calls > 0)
-		pthread_cond_wait(&audio_monitor->api_idle, &audio_monitor->mutex);
-	AudioQueueRef queue = audio_monitor->queue;
-	pthread_mutex_unlock(&audio_monitor->mutex);
-
-	if (queue)
-		AudioQueueStop(queue, true);
-
-	pthread_mutex_lock(&audio_monitor->mutex);
-	for (size_t i = 0; i < 3; i++) {
-		if (audio_monitor->buffers[i]) {
-			AudioQueueFreeBuffer(queue, audio_monitor->buffers[i]);
-			audio_monitor->buffers[i] = NULL;
-		}
-	}
+	pthread_mutex_lock(&m->mutex);
+	m->accepting = false;
+	m->queue = NULL;
+	m->frames = 0;
+	m->read_frame = 0;
+	memset(m->buffers, 0, sizeof(m->buffers));
+	memset(m->ready, 0, sizeof(m->ready));
+	pthread_mutex_unlock(&m->mutex);
+	/* Synchronous disposal waits for callbacks and frees allocated buffers.
+	 * Do not hold the callback mutex across this call. */
 	if (queue)
 		AudioQueueDispose(queue, true);
-	audio_monitor->queue = NULL;
-	deque_free(&audio_monitor->empty_buffers);
-	deque_free(&audio_monitor->new_data);
-	audio_resampler_destroy(audio_monitor->resampler);
-	audio_monitor->resampler = NULL;
-	audio_monitor->paused = false;
-	audio_monitor->stopping = false;
-	pthread_cond_broadcast(&audio_monitor->api_idle);
-	pthread_mutex_unlock(&audio_monitor->mutex);
 }
 
-void audio_monitor_start(struct audio_monitor *audio_monitor)
+static OSStatus open_queue(struct audio_monitor *m, AudioQueueRef *queue, uint64_t generation)
 {
-	if (!audio_monitor)
-		return;
-	pthread_mutex_lock(&audio_monitor->mutex);
-	if (os_atomic_load_bool(&audio_monitor->active) ||
-	    audio_monitor->stopping || audio_monitor->queue) {
-		pthread_mutex_unlock(&audio_monitor->mutex);
-		return;
-	}
-	const struct audio_output_info *info =
-		audio_output_get_info(obs_get_audio());
-	audio_monitor->channels = get_audio_channels(info->speakers);
-	audio_monitor->buffer_size = audio_monitor->channels * sizeof(float) *
-				     info->samples_per_sec / 100 * 3;
-	audio_monitor->wait_size = audio_monitor->buffer_size * 3;
 	AudioStreamBasicDescription desc = {
-		.mSampleRate = (Float64)info->samples_per_sec,
+		.mSampleRate = m->sample_rate,
 		.mFormatID = kAudioFormatLinearPCM,
-		.mFormatFlags = kAudioFormatFlagIsFloat |
-				kAudioFormatFlagIsPacked,
-		.mBytesPerPacket = sizeof(float) * audio_monitor->channels,
+		.mFormatFlags = kAudioFormatFlagIsFloat | kAudioFormatFlagIsPacked,
+		.mBytesPerPacket = sizeof(float) * m->channels,
 		.mFramesPerPacket = 1,
-		.mBytesPerFrame = sizeof(float) * audio_monitor->channels,
-		.mChannelsPerFrame = audio_monitor->channels,
-		.mBitsPerChannel = sizeof(float) * 8};
-
-	OSStatus stat = AudioQueueNewOutput(&desc, buffer_audio, audio_monitor,
-					    NULL, NULL, 0,
-					    &audio_monitor->queue);
-	if (!success(stat, "AudioStreamBasicDescription")) {
-		goto fail;
+		.mBytesPerFrame = sizeof(float) * m->channels,
+		.mChannelsPerFrame = m->channels,
+		.mBitsPerChannel = sizeof(float) * 8,
+	};
+	OSStatus status = AudioQueueNewOutput(&desc, buffer_audio, m, NULL, NULL, 0, queue);
+	if (status != noErr)
+		return status;
+	if (strcmp(m->device_id, "default") != 0) {
+		CFStringRef uid = CFStringCreateWithCString(NULL, m->device_id, kCFStringEncodingUTF8);
+		if (!uid)
+			return kAudioQueueErr_InvalidDevice;
+		status = AudioQueueSetProperty(*queue, kAudioQueueProperty_CurrentDevice, &uid, sizeof(uid));
+		CFRelease(uid);
+		if (status != noErr)
+			return status;
 	}
-	if (strcmp(audio_monitor->device_id, "default") != 0) {
-		CFStringRef cf_uid = CFStringCreateWithBytes(
-			NULL, (const UInt8 *)audio_monitor->device_id,
-			strlen(audio_monitor->device_id), kCFStringEncodingUTF8,
-			false);
+	AudioQueueBufferRef buffers[QUEUE_BUFFERS] = {0};
+	size_t bytes = m->buffer_frames * m->channels * sizeof(float);
+	for (size_t i = 0; i < QUEUE_BUFFERS; i++) {
+		status = AudioQueueAllocateBuffer(*queue, (UInt32)bytes, &buffers[i]);
+		if (status != noErr)
+			return status;
+		memset(buffers[i]->mAudioData, 0, bytes);
+		buffers[i]->mAudioDataByteSize = (UInt32)bytes;
+		status = AudioQueueEnqueueBuffer(*queue, buffers[i], 0, NULL);
+		if (status != noErr)
+			return status;
+	}
+	pthread_mutex_lock(&m->mutex);
+	bool current = !m->quit && m->enabled && m->generation == generation;
+	if (current) {
+		m->queue = *queue;
+		memcpy(m->buffers, buffers, sizeof(buffers));
+		m->accepting = true;
+	}
+	pthread_mutex_unlock(&m->mutex);
+	if (!current)
+		return noErr;
+	return AudioQueueStart(*queue, NULL);
+}
 
-		stat = AudioQueueSetProperty(audio_monitor->queue,
-					     kAudioQueueProperty_CurrentDevice,
-					     &cf_uid, sizeof(cf_uid));
-		CFRelease(cf_uid);
-		if (!success(stat, "set current device")) {
-			goto fail;
+/* mutex held; consume only bounded, preallocated storage. Pad underruns with
+ * silence instead of repeatedly pausing/restarting the output device. */
+static void fill_buffer(struct audio_monitor *m, AudioQueueBufferRef buffer)
+{
+	size_t count = m->frames < m->buffer_frames ? m->frames : m->buffer_frames;
+	size_t first = count;
+	if (first > m->capacity - m->read_frame)
+		first = m->capacity - m->read_frame;
+	size_t stride = m->channels * sizeof(float);
+	memcpy(buffer->mAudioData, m->samples + m->read_frame * m->channels, first * stride);
+	memcpy((uint8_t *)buffer->mAudioData + first * stride, m->samples, (count - first) * stride);
+	memset((uint8_t *)buffer->mAudioData + count * stride, 0, (m->buffer_frames - count) * stride);
+	m->read_frame = (m->read_frame + count) % m->capacity;
+	m->frames -= count;
+	buffer->mAudioDataByteSize = (UInt32)(m->buffer_frames * stride);
+}
+
+static void *monitor_worker(void *data)
+{
+	struct audio_monitor *m = data;
+	uint64_t last_generation = UINT64_MAX;
+	unsigned failures = 0;
+	pthread_mutex_lock(&m->mutex);
+	while (!m->quit) {
+		if (last_generation != m->generation) {
+			last_generation = m->generation;
+			failures = 0;
+		}
+		if (!m->enabled || failures >= MAX_QUEUE_FAILURES) {
+			pthread_cond_wait(&m->wake, &m->mutex);
+			continue;
+		}
+		uint64_t generation = m->generation;
+		pthread_mutex_unlock(&m->mutex);
+		AudioQueueRef queue = NULL;
+		OSStatus status = open_queue(m, &queue, generation);
+		pthread_mutex_lock(&m->mutex);
+		while (status == noErr && !m->quit && m->enabled && m->generation == generation) {
+			size_t index = 0;
+			while (index < QUEUE_BUFFERS && !m->ready[index])
+				index++;
+			if (index == QUEUE_BUFFERS) {
+				pthread_cond_wait(&m->wake, &m->mutex);
+				continue;
+			}
+			m->ready[index] = false;
+			AudioQueueBufferRef buffer = m->buffers[index];
+			fill_buffer(m, buffer);
+			pthread_mutex_unlock(&m->mutex);
+			status = AudioQueueEnqueueBuffer(queue, buffer, 0, NULL);
+			pthread_mutex_lock(&m->mutex);
+		}
+		pthread_mutex_unlock(&m->mutex);
+		close_queue(m, queue);
+		pthread_mutex_lock(&m->mutex);
+		if (status != noErr && m->enabled && !m->quit && m->generation == generation) {
+			failures++;
+			pthread_mutex_unlock(&m->mutex);
+			blog(LOG_WARNING, "[Audio Monitor — maurojuniorr Rebuild v4] device %s: queue failed: %d (%u/%d)",
+			     m->device_id, (int)status, failures, MAX_QUEUE_FAILURES);
+			pthread_mutex_lock(&m->mutex);
+			struct timespec deadline;
+			clock_gettime(CLOCK_REALTIME, &deadline);
+			deadline.tv_sec++;
+			while (!m->quit && m->enabled && m->generation == generation) {
+				if (pthread_cond_timedwait(&m->wake, &m->mutex, &deadline) == ETIMEDOUT)
+					break;
+			}
 		}
 	}
-	stat = AudioQueueSetParameter(audio_monitor->queue,
-				      kAudioQueueParam_Volume, 1.0);
-	if (!success(stat, "set volume")) {
-		goto fail;
-	}
+	pthread_mutex_unlock(&m->mutex);
+	return NULL;
+}
 
-	for (size_t i = 0; i < 3; i++) {
-		stat = AudioQueueAllocateBuffer(audio_monitor->queue,
-						audio_monitor->buffer_size,
-						&audio_monitor->buffers[i]);
-		if (!success(stat, "allocation of buffer")) {
-			goto fail;
-		}
+void audio_monitor_start(struct audio_monitor *m)
+{
+	if (!m)
+		return;
+	pthread_mutex_lock(&m->mutex);
+	m->enabled = true;
+	m->generation++;
+	pthread_cond_signal(&m->wake);
+	pthread_mutex_unlock(&m->mutex);
+}
 
-		deque_push_back(&audio_monitor->empty_buffers,
-				    &audio_monitor->buffers[i],
-				    sizeof(audio_monitor->buffers[i]));
-	}
-	struct resample_info from = {.samples_per_sec = info->samples_per_sec,
-				     .speakers = info->speakers,
-				     .format = AUDIO_FORMAT_FLOAT_PLANAR};
-	struct resample_info to = {.samples_per_sec = info->samples_per_sec,
-				   .speakers = info->speakers,
-				   .format = AUDIO_FORMAT_FLOAT};
-	audio_monitor->resampler = audio_resampler_create(&to, &from);
-	if (!audio_monitor->resampler) {
-		goto fail;
-	}
-
-	os_atomic_store_bool(&audio_monitor->active, true);
-	audio_monitor->api_calls++;
-	AudioQueueRef queue = audio_monitor->queue;
-	pthread_mutex_unlock(&audio_monitor->mutex);
-
-	stat = AudioQueueStart(queue, NULL);
-	pthread_mutex_lock(&audio_monitor->mutex);
-	audio_monitor->api_calls--;
-	pthread_cond_broadcast(&audio_monitor->api_idle);
-	bool started = success(stat, "start");
-	if (!started)
-		os_atomic_store_bool(&audio_monitor->active, false);
-	pthread_mutex_unlock(&audio_monitor->mutex);
-	if (!started)
-		audio_monitor_stop(audio_monitor);
-	return;
-
-fail:
-	for (size_t i = 0; i < 3; i++) {
-		if (audio_monitor->buffers[i]) {
-			AudioQueueFreeBuffer(audio_monitor->queue, audio_monitor->buffers[i]);
-			audio_monitor->buffers[i] = NULL;
-		}
-	}
-	if (audio_monitor->queue)
-		AudioQueueDispose(audio_monitor->queue, true);
-	audio_monitor->queue = NULL;
-	deque_free(&audio_monitor->empty_buffers);
-	deque_free(&audio_monitor->new_data);
-	audio_resampler_destroy(audio_monitor->resampler);
-	audio_monitor->resampler = NULL;
-	pthread_mutex_unlock(&audio_monitor->mutex);
+void audio_monitor_stop(struct audio_monitor *m)
+{
+	if (!m)
+		return;
+	pthread_mutex_lock(&m->mutex);
+	m->enabled = false;
+	m->accepting = false;
+	m->generation++;
+	m->frames = 0;
+	pthread_cond_signal(&m->wake);
+	pthread_mutex_unlock(&m->mutex);
 }
 
 void audio_monitor_audio(void *data, struct obs_audio_data *audio)
 {
-	struct audio_monitor *audio_monitor = data;
-	AudioQueueRef restart_queue = NULL;
-	if (!audio_monitor->resampler && audio_monitor->device_id &&
-	    strlen(audio_monitor->device_id)) {
-		audio_monitor_start(audio_monitor);
-	}
-	if (!os_atomic_load_bool(&audio_monitor->active))
+	struct audio_monitor *m = data;
+	if (!m || !audio || !audio->frames || pthread_mutex_trylock(&m->mutex) != 0)
 		return;
-	if (!audio_monitor->resampler ||
-	    pthread_mutex_trylock(&audio_monitor->mutex) != 0)
-		return;
-	if (!os_atomic_load_bool(&audio_monitor->active) || audio_monitor->stopping) {
-		pthread_mutex_unlock(&audio_monitor->mutex);
+	if (!m->enabled || !m->accepting) {
+		pthread_mutex_unlock(&m->mutex);
 		return;
 	}
-
-	uint8_t *resample_data[MAX_AV_PLANES];
-	uint32_t resample_frames;
-	uint64_t ts_offset;
-	bool success = audio_resampler_resample(
-		audio_monitor->resampler, resample_data, &resample_frames,
-		&ts_offset, (const uint8_t *const *)audio->data,
-		(uint32_t)audio->frames);
-	if (!success) {
-		pthread_mutex_unlock(&audio_monitor->mutex);
-		return;
+	/* OBS supplies float planar audio in its output channel layout/rate.
+	 * Interleave directly, without allocation or CoreAudio calls. */
+	size_t count = audio->frames < m->capacity ? audio->frames : m->capacity;
+	size_t skip = audio->frames - count;
+	if (m->frames + count > m->capacity) {
+		size_t discard = m->frames + count - m->capacity;
+		m->read_frame = (m->read_frame + discard) % m->capacity;
+		m->frames -= discard;
 	}
-	/* apply volume */
-	float vol = audio_monitor->volume;
-	if (!close_float(vol, 1.0f, EPSILON)) {
-		register float *cur = (float *)resample_data[0];
-		register float *end =
-			cur + resample_frames * audio_monitor->channels;
-
-		while (cur < end)
-			*(cur++) *= vol;
+	size_t write = (m->read_frame + m->frames) % m->capacity;
+	float left = 1.0f, right = 1.0f;
+	if (m->balance != 0.0f) {
+		float balance = (m->balance + 1.0f) / 2.0f;
+		left = sinf((1.0f - balance) * (float)(M_PI / 2.0));
+		right = sinf(balance * (float)(M_PI / 2.0));
 	}
-	/* apply mono */
-	if (audio_monitor->mono && audio_monitor->channels > 1) {
-		for (uint32_t frame = 0; frame < resample_frames; frame++) {
-			float avg = 0.0f;
-			for (uint32_t channel = 0; channel < audio_monitor->channels; channel++) {
-				avg += ((float *)resample_data[0])[frame * audio_monitor->channels + channel];
-			}
-			avg /= (float)audio_monitor->channels;
-			for (uint32_t channel = 0; channel < audio_monitor->channels; channel++) {
-				((float *)resample_data[0])[frame * audio_monitor->channels + channel] = avg;
-			}
+	for (size_t i = 0; i < count; i++) {
+		float *out = m->samples + write * m->channels;
+		float sum = 0.0f;
+		for (uint32_t c = 0; c < m->channels; c++) {
+			const float *plane = (const float *)audio->data[c];
+			out[c] = plane ? plane[skip + i] * m->volume : 0.0f;
+			sum += out[c];
 		}
-	}
-	/* apply balance */
-	float bal = (audio_monitor->balance + 1.0f) / 2.0f;
-	if (!close_float(bal, 0.5f, EPSILON) && audio_monitor->channels > 1) {
-			for (uint32_t frame = 0; frame < resample_frames; frame++) {
-				((float *)resample_data[0])[frame * audio_monitor->channels + 0] =
-					((float *)resample_data[0])[frame * audio_monitor->channels + 0] *
-					sinf((1.0f - bal) * (M_PI / 2.0f));
-				((float *)resample_data[0])[frame * audio_monitor->channels + 1] =
-					((float *)resample_data[0])[frame * audio_monitor->channels + 1] *
-					sinf(bal * (M_PI / 2.0f));
-			}
-	}
-	uint32_t bytes =
-		sizeof(float) * audio_monitor->channels * resample_frames;
-	/* Bound queued audio to roughly 480 ms.  Old audio is less useful than
-	 * unbounded latency and memory growth when an output device stalls. */
-	size_t max_buffered = audio_monitor->buffer_size * 16;
-	if (audio_monitor->new_data.size + bytes > max_buffered) {
-		size_t discard = audio_monitor->new_data.size + bytes - max_buffered;
-		size_t frame_size = sizeof(float) * audio_monitor->channels;
-		discard = (discard + frame_size - 1) / frame_size * frame_size;
-		if (discard > audio_monitor->new_data.size)
-			discard = audio_monitor->new_data.size;
-		deque_pop_front(&audio_monitor->new_data, NULL, discard);
-	}
-	deque_push_back(&audio_monitor->new_data, resample_data[0], bytes);
-	if (audio_monitor->new_data.size >= audio_monitor->wait_size) {
-		audio_monitor->wait_size = 0;
-
-		while (audio_monitor->empty_buffers.size > 0) {
-			if (!fill_buffer(audio_monitor)) {
-				break;
-			}
+		if (m->mono && m->channels > 1)
+			for (uint32_t c = 0; c < m->channels; c++)
+				out[c] = sum / m->channels;
+		if (m->channels > 1) {
+			out[0] *= left;
+			out[1] *= right;
 		}
-
-		if (audio_monitor->paused) {
-			audio_monitor->paused = false;
-			audio_monitor->api_calls++;
-			restart_queue = audio_monitor->queue;
-		}
+		write = (write + 1) % m->capacity;
 	}
-	pthread_mutex_unlock(&audio_monitor->mutex);
-
-	if (restart_queue) {
-		OSStatus stat = AudioQueueStart(restart_queue, NULL);
-		pthread_mutex_lock(&audio_monitor->mutex);
-		audio_monitor->api_calls--;
-		pthread_cond_broadcast(&audio_monitor->api_idle);
-		if (!success(stat, "restart") && os_atomic_load_bool(&audio_monitor->active))
-			audio_monitor->paused = true;
-		pthread_mutex_unlock(&audio_monitor->mutex);
-	}
+	m->frames += count;
+	pthread_mutex_unlock(&m->mutex);
 }
 
-void audio_monitor_set_volume(struct audio_monitor *audio_monitor, float volume)
+void audio_monitor_set_volume(struct audio_monitor *m, float volume)
 {
-	if (!audio_monitor)
-		return;
-	pthread_mutex_lock(&audio_monitor->mutex);
-	audio_monitor->volume = volume;
-	pthread_mutex_unlock(&audio_monitor->mutex);
+	if (!m) return;
+	pthread_mutex_lock(&m->mutex);
+	m->volume = volume;
+	pthread_mutex_unlock(&m->mutex);
 }
 
-void audio_monitor_set_mono(struct audio_monitor *audio_monitor, bool mono)
+void audio_monitor_set_mono(struct audio_monitor *m, bool mono)
 {
-	if (!audio_monitor)
-		return;
-	pthread_mutex_lock(&audio_monitor->mutex);
-	audio_monitor->mono = mono;
-	pthread_mutex_unlock(&audio_monitor->mutex);
+	if (!m) return;
+	pthread_mutex_lock(&m->mutex);
+	m->mono = mono;
+	pthread_mutex_unlock(&m->mutex);
 }
 
-void audio_monitor_set_balance(struct audio_monitor *audio_monitor, float balance)
+void audio_monitor_set_balance(struct audio_monitor *m, float balance)
 {
-	if (!audio_monitor)
-		return;
-	pthread_mutex_lock(&audio_monitor->mutex);
-	audio_monitor->balance = balance;
-	pthread_mutex_unlock(&audio_monitor->mutex);
+	if (!m) return;
+	pthread_mutex_lock(&m->mutex);
+	m->balance = balance;
+	pthread_mutex_unlock(&m->mutex);
 }
 
-struct audio_monitor *audio_monitor_create(const char *device_id,
-				   const char *source_name, int port)
+struct audio_monitor *audio_monitor_create(const char *device_id, const char *source_name, int port)
 {
 	UNUSED_PARAMETER(source_name);
 	UNUSED_PARAMETER(port);
-	struct audio_monitor *audio_monitor = bzalloc(sizeof(struct audio_monitor));
-	audio_monitor->device_id = bstrdup(device_id);
-	pthread_mutex_init(&audio_monitor->mutex, NULL);
-	pthread_cond_init(&audio_monitor->api_idle, NULL);
-	return audio_monitor;
-}
-
-void audio_monitor_destroy(struct audio_monitor *audio_monitor)
-{
-	if (!audio_monitor)
-		return;
-	audio_monitor_stop(audio_monitor);
-	pthread_cond_destroy(&audio_monitor->api_idle);
-	pthread_mutex_destroy(&audio_monitor->mutex);
-	bfree(audio_monitor->device_id);
-	bfree(audio_monitor);
-}
-
-const char *audio_monitor_get_device_id(struct audio_monitor *audio_monitor)
-{
-	if (!audio_monitor)
+	struct obs_audio_info info;
+	if (!device_id || !*device_id || !obs_get_audio_info(&info))
 		return NULL;
-	return audio_monitor->device_id;
+	struct audio_monitor *m = bzalloc(sizeof(*m));
+	m->channels = get_audio_channels(info.speakers);
+	m->sample_rate = info.samples_per_sec;
+	if (!m->channels || !m->sample_rate) {
+		bfree(m);
+		return NULL;
+	}
+	m->buffer_frames = m->sample_rate * 30 / 1000;
+	m->capacity = m->buffer_frames * 16;
+	m->samples = bzalloc(m->capacity * m->channels * sizeof(float));
+	m->device_id = bstrdup(device_id);
+	m->volume = 1.0f;
+	pthread_mutex_init(&m->mutex, NULL);
+	pthread_cond_init(&m->wake, NULL);
+	m->worker_created = pthread_create(&m->worker, NULL, monitor_worker, m) == 0;
+	if (!m->worker_created) {
+		pthread_cond_destroy(&m->wake);
+		pthread_mutex_destroy(&m->mutex);
+		bfree(m->samples);
+		bfree(m->device_id);
+		bfree(m);
+		return NULL;
+	}
+	return m;
 }
 
-void audio_monitor_set_format(struct audio_monitor *audio_monitor,
-			      enum audio_format format){
-	UNUSED_PARAMETER(audio_monitor);
+void audio_monitor_destroy(struct audio_monitor *m)
+{
+	if (!m) return;
+	pthread_mutex_lock(&m->mutex);
+	m->quit = true;
+	m->enabled = false;
+	m->accepting = false;
+	pthread_cond_signal(&m->wake);
+	pthread_mutex_unlock(&m->mutex);
+	pthread_join(m->worker, NULL);
+	pthread_cond_destroy(&m->wake);
+	pthread_mutex_destroy(&m->mutex);
+	bfree(m->samples);
+	bfree(m->device_id);
+	bfree(m);
+}
+
+const char *audio_monitor_get_device_id(struct audio_monitor *m)
+{
+	return m ? m->device_id : NULL;
+}
+
+void audio_monitor_set_format(struct audio_monitor *m, enum audio_format format)
+{
+	UNUSED_PARAMETER(m);
 	UNUSED_PARAMETER(format);
 }
 
-void audio_monitor_set_samples_per_sec(struct audio_monitor *audio_monitor,
-				       long long samples_per_sec)
+void audio_monitor_set_samples_per_sec(struct audio_monitor *m, long long sample_rate)
 {
-	UNUSED_PARAMETER(audio_monitor);
-	UNUSED_PARAMETER(samples_per_sec);
+	UNUSED_PARAMETER(m);
+	UNUSED_PARAMETER(sample_rate);
 }

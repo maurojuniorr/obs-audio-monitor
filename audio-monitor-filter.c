@@ -641,7 +641,7 @@ OBS_MODULE_USE_DEFAULT_LOCALE("media-controls", "en-US")
 extern void load_audio_monitor_dock();
 bool obs_module_load()
 {
-	blog(LOG_INFO, "[Audio Monitor] loaded version %s", PROJECT_VERSION);
+	blog(LOG_INFO, "[Audio Monitor] loaded version %s — maurojuniorr Rebuild v4 (https://github.com/maurojuniorr)", PROJECT_VERSION);
 	obs_register_source(&audio_monitor_filter_info);
 	load_audio_monitor_dock();
 	return true;

@@ -1,0 +1,39 @@
+# macOS worker regression test
+
+The test includes the production macOS backend and substitutes AudioQueue
+creation, allocation, enqueue, start and disposal. It plays no sound and does
+not modify OBS settings. Requires macOS, Xcode, configured plugin dependencies,
+and OBS installed at `/Applications/OBS.app`.
+
+From the repository root:
+
+```sh
+clang -std=c17 -g -fsanitize=address,undefined \
+  -I .deps/Frameworks/libobs.framework/Headers -I .deps/include/obs \
+  -F /Applications/OBS.app/Contents/Frameworks tests/macos-worker-test.c \
+  -framework libobs -framework AudioToolbox -framework CoreFoundation \
+  -Wl,-rpath,/Applications/OBS.app/Contents/Frameworks \
+  -o build_macos/macos-worker-test
+build_macos/macos-worker-test
+```
+
+Replace `-fsanitize=address,undefined` with `-fsanitize=thread` for a separate
+ThreadSanitizer run (do not combine AddressSanitizer and ThreadSanitizer).
+
+Coverage: interleaving, gain/mono, bounded overflow, ring wraparound, silence
+padding, two workers, 20 stop/start cycles during delayed starts, synchronous
+callback reentry, disposal callbacks, three-attempt failure cap, explicit
+recovery, queue cleanup, and no intercepted AudioQueue calls on the producer.
+
+These simulated tests do not establish real-device stability. Before publishing
+a release or PR, test two physical outputs, repeated source disable/enable,
+scene switching, device unplug/replug, mute/volume changes and OBS shutdown.
+
+The v4 worker keeps the queue running with silence during source underruns.
+Explicit start/stop requests are asynchronous. After three consecutive queue
+failures in one generation it stops retrying until a new start request. Monitor
+destruction joins the worker, so a stalled OS disposal can still delay teardown,
+although normal capture no longer invokes AudioQueue APIs.
+
+Rebuild attribution: maurojuniorr, https://github.com/maurojuniorr.
+Original project authorship and license remain unchanged.
