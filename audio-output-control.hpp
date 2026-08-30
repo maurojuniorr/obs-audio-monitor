@@ -5,6 +5,7 @@
 #include <QLabel>
 #include <QSlider>
 #include <QWidget>
+#include <mutex>
 #include "volume-meter.hpp"
 
 #include "obs.h"
@@ -23,10 +24,12 @@ private:
 	VolumeMeter *volMeter;
 	QGridLayout *mainLayout;
 	QMap<QString, audio_monitor *> audioDevices;
+	QMap<QString, bool> mutedDevices;
+	std::mutex audioDevicesMutex;
 
-	float prev_samples[MAX_AUDIO_CHANNELS][4];
-	float magnitude[MAX_AUDIO_CHANNELS];
-	float peak[MAX_AUDIO_CHANNELS];
+	float prev_samples[MAX_AUDIO_CHANNELS][4]{};
+	float magnitude[MAX_AUDIO_CHANNELS]{};
+	float peak[MAX_AUDIO_CHANNELS]{};
 
 	static void OBSOutputAudio(void *param, size_t mix_idx, struct audio_data *data);
 
