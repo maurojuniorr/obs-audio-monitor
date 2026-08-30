@@ -520,7 +520,7 @@ static obs_properties_t *audio_monitor_properties(void *data)
 	obs_properties_add_text(
 		ppts, "plugin_info",
 		"<a href=\"https://obsproject.com/forum/resources/audio-monitor.1186/\">Audio Monitor</a> (" PROJECT_VERSION
-		") by <a href=\"https://www.exeldro.com\">Exeldro</a>",
+		") — Rebuild v4 by <a href=\"https://github.com/maurojuniorr\">maurojuniorr</a>",
 		OBS_TEXT_INFO);
 	return ppts;
 }
