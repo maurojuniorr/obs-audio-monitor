@@ -26,6 +26,14 @@ else()
 endif()
 
 find_package(Qt6 COMPONENTS Widgets Core)
+
+# Qt's older macOS dependency package still links the removed AGL framework.
+# WrapOpenGL only needs the OpenGL framework for this plugin, so keep builds
+# working with current Apple SDKs without modifying downloaded dependencies.
+if(OS_MACOS AND TARGET WrapOpenGL::WrapOpenGL)
+  set_property(TARGET WrapOpenGL::WrapOpenGL PROPERTY INTERFACE_LINK_LIBRARIES "-framework OpenGL")
+endif()
+
 if(BUILD_OUT_OF_TREE)
   if(OS_LINUX OR OS_FREEBSD OR OS_OPENBSD)
     find_package(Qt6 REQUIRED Gui)

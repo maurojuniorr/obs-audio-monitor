@@ -119,6 +119,11 @@ AudioOutputControl::AudioOutputControl(int track, obs_data_t *settings) : track(
 AudioOutputControl::~AudioOutputControl()
 {
 	audio_output_disconnect(obs_get_audio(), track, OBSOutputAudio, this);
+	std::lock_guard<std::mutex> lock(audioDevicesMutex);
+	for (auto *monitor : audioDevices)
+		audio_monitor_destroy(monitor);
+	audioDevices.clear();
+	mutedDevices.clear();
 }
 
 void AudioOutputControl::OBSOutputAudio(void *param, size_t mix_idx, struct audio_data *data)
@@ -134,6 +139,9 @@ void AudioOutputControl::OBSOutputAudio(void *param, size_t mix_idx, struct audi
 	size_t planes = audio_output_get_planes(oa);
 
 	size_t nr_samples = data->frames;
+	if (nr_samples == 0)
+		return;
+
 	int channel_nr = 0;
 	for (size_t plane_nr = 0; plane_nr < planes; plane_nr++) {
 		float *samples = (float *)data->data[plane_nr];
@@ -262,25 +270,13 @@ void AudioOutputControl::OBSOutputAudio(void *param, size_t mix_idx, struct audi
 	audio.frames = data->frames;
 	audio.timestamp = data->timestamp;
 
-	int columns = control->mainLayout->columnCount();
+	std::unique_lock<std::mutex> devicesLock(control->audioDevicesMutex, std::try_to_lock);
+	if (!devicesLock.owns_lock())
+		return;
+
 	auto d = control->audioDevices.begin();
 	while (d != control->audioDevices.end()) {
-		bool muted = false;
-		for (int column = 1; column < columns; column++) {
-			auto *item = control->mainLayout->itemAtPosition(control->sliderRow, column);
-			if (!item)
-				continue;
-			if (item->widget()->objectName() == d.key()) {
-				item = control->mainLayout->itemAtPosition(control->muteRow, column);
-				if (!item)
-					continue;
-				auto *mute = reinterpret_cast<QCheckBox *>(item->widget());
-				if (mute->isChecked())
-					muted = true;
-				break;
-			}
-		}
-		if (!muted) {
+		if (!control->mutedDevices.value(d.key(), false)) {
 			audio_monitor *monitor = d.value();
 			audio_monitor_audio(monitor, &audio);
 		}
@@ -309,7 +305,10 @@ void AudioOutputControl::LockVolumeControl(bool lock)
 void AudioOutputControl::SliderChanged(int vol)
 {
 	QWidget *w = reinterpret_cast<QWidget *>(sender());
-	audio_monitor_set_volume(audioDevices[w->objectName()], (float)vol / 10000.0f);
+	std::lock_guard<std::mutex> lock(audioDevicesMutex);
+	auto *monitor = audioDevices.value(w->objectName(), nullptr);
+	if (monitor)
+		audio_monitor_set_volume(monitor, (float)vol / 10000.0f);
 }
 
 obs_data_t *AudioOutputControl::GetSettings()
@@ -344,17 +343,23 @@ bool AudioOutputControl::HasDevice(QString device_id)
 {
 	if (device_id.isEmpty())
 		return false;
+	std::lock_guard<std::mutex> lock(audioDevicesMutex);
 	auto it = audioDevices.find(device_id);
 	return it != audioDevices.end();
 }
 
 void AudioOutputControl::AddDevice(QString device_id, QString device_name)
 {
-	auto it = audioDevices.find(device_id);
-	if (it == audioDevices.end()) {
+	bool createMonitor;
+	{
+		std::lock_guard<std::mutex> lock(audioDevicesMutex);
+		createMonitor = audioDevices.find(device_id) == audioDevices.end();
+	}
+	if (createMonitor) {
 		audio_monitor *monitor = audio_monitor_create(QT_TO_UTF8(device_id), QT_TO_UTF8(device_name), 0);
 		audio_monitor_set_volume(monitor, 1.0f);
 		audio_monitor_start(monitor);
+		std::lock_guard<std::mutex> lock(audioDevicesMutex);
 		audioDevices[device_id] = monitor;
 	}
 
@@ -415,6 +420,10 @@ void AudioOutputControl::addDeviceColumn(int column, QString device_id, QString 
 		mute->setChecked(muted);
 		mute->setEnabled(!lock);
 		mute->setProperty("class", "btn-mute");
+		connect(mute, &QAbstractButton::toggled, this, [this, device_id](bool value) {
+			std::lock_guard<std::mutex> lock(audioDevicesMutex);
+			mutedDevices[device_id] = value;
+		});
 
 		mainLayout->addWidget(mute, muteRow, column, Qt::AlignHCenter);
 	} else {
@@ -422,19 +431,33 @@ void AudioOutputControl::addDeviceColumn(int column, QString device_id, QString 
 		auto *mute = new MuteCheckBox();
 		mute->setChecked(muted);
 		mute->setEnabled(!lock);
+		connect(mute, &QAbstractButton::toggled, this, [this, device_id](bool value) {
+			std::lock_guard<std::mutex> lock(audioDevicesMutex);
+			mutedDevices[device_id] = value;
+		});
 
 		mainLayout->addWidget(mute, muteRow, column, Qt::AlignHCenter);
+	}
+	{
+		std::lock_guard<std::mutex> guard(audioDevicesMutex);
+		mutedDevices[device_id] = muted;
 	}
 }
 
 void AudioOutputControl::RemoveDevice(QString device_id)
 {
-	const auto it = audioDevices.find(device_id);
-	if (it != audioDevices.end()) {
-		auto *monitor = it.value();
-		audio_monitor_destroy(monitor);
-		audioDevices.remove(device_id);
+	audio_monitor *monitor = nullptr;
+	{
+		std::lock_guard<std::mutex> lock(audioDevicesMutex);
+		const auto it = audioDevices.find(device_id);
+		if (it != audioDevices.end()) {
+			monitor = it.value();
+			audioDevices.erase(it);
+		}
+		mutedDevices.remove(device_id);
 	}
+	if (monitor)
+		audio_monitor_destroy(monitor);
 	const auto columns = mainLayout->columnCount();
 	auto found = false;
 	for (auto column = 1; column < columns; column++) {
@@ -469,6 +492,7 @@ void AudioOutputControl::RemoveDevice(QString device_id)
 
 void AudioOutputControl::Reset()
 {
+	std::lock_guard<std::mutex> lock(audioDevicesMutex);
 	for (auto d = audioDevices.begin(); d != audioDevices.end(); d++) {
 		audio_monitor_stop(d.value());
 		audio_monitor_start(d.value());
